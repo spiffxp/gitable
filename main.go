@@ -94,7 +94,7 @@ func main() {
 	p.FlagSet.StringVar(&o.airtableTableName, "airtable-table", os.Getenv("AIRTABLE_TABLE"), "Airtable Table (or env var AIRTABLE_TABLE)")
 
 	p.FlagSet.BoolVar(&o.watched, "watched", false, "include the watched repositories")
-	p.FlagSet.StringVar(&o.watchSince, "watch-since", "2008-01-01T00:00:00Z", "defines the starting point of the issues been watched (format: 2006-01-02T15:04:05Z). defaults to no filter")
+	p.FlagSet.StringVar(&o.watchSince, "watch-since", "2008-01-01T00:00:00Z", "defines the starting point of the issues been watched (ex. 2006-01-02T15:04:05Z)")
 
 	p.FlagSet.BoolVar(&o.debug, "debug", false, "enable debug logging")
 	p.FlagSet.BoolVar(&o.debug, "d", false, "enable debug logging")
@@ -147,12 +147,6 @@ func main() {
 			logrus.Fatal(err)
 		}
 
-		// Affiliation must be set before we add the user to the "orgs".
-		affiliation := "owner,collaborator"
-		if len(o.orgs) > 0 {
-			affiliation += ",organization_member"
-		}
-
 		// If we didn't get any orgs explicitly passed, use the current user.
 		if len(o.orgs) == 0 {
 			// Add the current github user to orgs.
@@ -170,7 +164,7 @@ func main() {
 
 		// If the user passed the once flag, just do the run once and exit.
 		if o.once {
-			if err := bot.run(ctx, affiliation, o.airtableTableName, o.autofill, o.orgs, o.watched, o.watchSince); err != nil {
+			if err := bot.run(ctx, o.airtableTableName, o.autofill, o.orgs, o.watched, o.watchSince); err != nil {
 				logrus.Fatal(err)
 			}
 			logrus.Infof("Updated airtable table %s for base %s", o.airtableTableName, o.airtableBaseID)
@@ -179,7 +173,7 @@ func main() {
 
 		logrus.Infof("Starting bot to update airtable table %s for base %s every %s", o.airtableTableName, o.airtableBaseID, o.interval)
 		for range ticker.C {
-			if err := bot.run(ctx, affiliation, o.airtableTableName, o.autofill, o.orgs, o.watched, o.watchSince); err != nil {
+			if err := bot.run(ctx, o.airtableTableName, o.autofill, o.orgs, o.watched, o.watchSince); err != nil {
 				logrus.Fatal(err)
 			}
 		}
@@ -220,45 +214,47 @@ type Fields struct {
 	Repository string
 }
 
-func (bot *bot) run(ctx context.Context, affiliation string, airtableTableName string, autofill bool, orgs stringSlice, watched bool, watchSince string) error {
-	// if we are in autofill mode, get our repositories
-	if autofill {
-		if err := bot.getRepositories(ctx, affiliation, orgs); err != nil {
-			logrus.Errorf("Failed to get repos, %v\n", err)
-			return err
-		}
+func (bot *bot) run(ctx context.Context, airtableTableName string, autofill bool, orgs stringSlice, watched bool, watchSince string) error {
+	logrus.Infof("refreshing github issues into airtable '%s'", airtableTableName)
+
+	// Get any github repos we're supposed to get
+	repos, err := bot.getRepositories(ctx, autofill, orgs, watched)
+	if err != nil {
+		logrus.Warnf("Failed to get repos: %v\n", err)
+		return err
 	}
 
+	// Get any records already in the airtable
 	ghRecords := []githubRecord{}
 	if err := bot.airtableClient.ListRecords(airtableTableName, &ghRecords); err != nil {
 		return fmt.Errorf("listing records for table %s failed: %v", airtableTableName, err)
 	}
 
+	// Find the most recent of watchSince and "Updated" fields in airtable
 	since, err := time.Parse("2006-01-02T15:04:05Z", watchSince)
 	if err != nil {
 		return err
 	}
-
 	for _, record := range ghRecords {
 		if record.Fields.Updated.After(since) {
 			since = record.Fields.Updated
 		}
 	}
 
-	// if we are in watching mode, get your watched repositories
-	if watched {
-		if err := bot.getWatchedRepositories(ctx, since); err != nil {
-			logrus.Errorf("Failed to get watched repos, %v\n", err)
+	// Get issues for any repos we got, since the most recent date determined above
+	for _, repo := range repos {
+		if err := bot.getIssues(ctx, repo.GetOwner().GetLogin(), repo.GetName(), since); err != nil {
+			logrus.Warnf("Failed to get issues for repo %s - %v\n", repo.GetName(), err)
 			return err
 		}
 	}
 
-	// Iterate over the records.
+	// Update existing airtable records
 	for _, record := range ghRecords {
 		// Parse the reference.
 		user, repo, id, err := parseReference(record.Fields.Reference)
 		if err != nil {
-			logrus.Infof("Reference for %v failed:\n%v\n", record, err)
+			logrus.Warnf("Reference for %v failed:\n%v\n", record, err)
 			continue
 		}
 
@@ -396,10 +392,34 @@ func (bot *bot) applyRecordToTable(ctx context.Context, issue *github.Issue, key
 	return nil
 }
 
-func (bot *bot) getRepositories(ctx context.Context, affiliation string, orgs stringSlice) error {
-	logrus.Infof("getting repositories for org[s]: %s...", strings.Join(orgs, ", "))
+func (bot *bot) getRepositories(ctx context.Context, autofill bool, orgs stringSlice, watched bool) ([]*github.Repository, error) {
+	allRepos := []*github.Repository{}
+	// if we are in autofill mode, get our repositories
+	if autofill {
+		if repos, err := bot.getUserRepositories(ctx, orgs); err != nil {
+			logrus.Errorf("Failed to get user repos, %v\n", err)
+			return nil, err
+		} else {
+			allRepos = append(allRepos, repos...)
+		}
+	}
+	// if we are in watched mode, get our watched repositories
+	if watched {
+		if repos, err := bot.getWatchedRepositories(ctx); err != nil {
+			logrus.Errorf("Failed to get watched repos, %v\n", err)
+			return nil, err
+		} else {
+			allRepos = append(allRepos, repos...)
+		}
+	}
+
+	allRepos = dedupe(allRepos)
+	return allRepos, nil
+}
+
+func (bot *bot) getUserRepositories(ctx context.Context, orgs stringSlice) ([]*github.Repository, error) {
+	logrus.Infof("getting github repos for user '%s' filtered to org[s] '%s'...", bot.ghLogin, strings.Join(orgs, ", "))
 	opt := &github.RepositoryListOptions{
-		Affiliation: affiliation,
 		ListOptions: github.ListOptions{
 			Page:    1,
 			PerPage: githubPageSize,
@@ -409,31 +429,25 @@ func (bot *bot) getRepositories(ctx context.Context, affiliation string, orgs st
 	for {
 		repos, resp, err := bot.ghClient.Repositories.List(ctx, "", opt)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		allRepos = append(allRepos, repos...)
+		for _, repo := range repos {
+			if in(orgs, repo.GetOwner().GetLogin()) {
+				allRepos = append(allRepos, repo)
+			} else {
+				logrus.Debugf("ignoring repo %s because its not in %s", repo.GetFullName(), orgs)
+			}
+		}
 		if resp.NextPage == 0 {
 			break
 		}
 		opt.Page = resp.NextPage
 	}
-
-	for _, repo := range allRepos {
-		logrus.Debugf("checking if %s is in (%s)", repo.GetOwner().GetLogin(), strings.Join(orgs, " | "))
-		if in(orgs, repo.GetOwner().GetLogin()) {
-			logrus.Debugf("getting issues for repo %s...", repo.GetFullName())
-			if err := bot.getIssues(ctx, repo.GetOwner().GetLogin(), repo.GetName(), repo.UpdatedAt.Time); err != nil {
-				logrus.Debugf("Failed to get issues for repo %s - %v\n", repo.GetName(), err)
-				return err
-			}
-		}
-	}
-
-	return nil
+	return allRepos, nil
 }
 
-func (bot *bot) getWatchedRepositories(ctx context.Context, since time.Time) error {
-	logrus.Infof("getting repositories watched by %s...", bot.ghLogin)
+func (bot *bot) getWatchedRepositories(ctx context.Context) ([]*github.Repository, error) {
+	logrus.Infof("getting github repos watched by user '%s'...", bot.ghLogin)
 	opt := &github.ListOptions{
 		Page:    1,
 		PerPage: githubPageSize,
@@ -442,7 +456,7 @@ func (bot *bot) getWatchedRepositories(ctx context.Context, since time.Time) err
 	for {
 		repos, resp, err := bot.ghClient.Activity.ListWatched(ctx, "", opt)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		allRepos = append(allRepos, repos...)
 		if resp.NextPage == 0 {
@@ -450,17 +464,11 @@ func (bot *bot) getWatchedRepositories(ctx context.Context, since time.Time) err
 		}
 		opt.Page = resp.NextPage
 	}
-
-	for _, repo := range allRepos {
-		logrus.Infof("getting issues for repo %s...", repo.GetFullName())
-		if err := bot.getIssues(ctx, repo.GetOwner().GetLogin(), repo.GetName(), since); err != nil {
-			return err
-		}
-	}
-	return nil
+	return allRepos, nil
 }
 
 func (bot *bot) getIssues(ctx context.Context, owner, repo string, since time.Time) error {
+	logrus.Infof("getting github issues for repo %s/%s since %v...", owner, repo, since)
 	opt := &github.IssueListByRepoOptions{
 		State: "all",
 		Since: since,
@@ -484,7 +492,6 @@ func (bot *bot) getIssues(ctx context.Context, owner, repo string, since time.Ti
 
 	for _, issue := range allIssues {
 		key := createReference(owner, repo, issue.GetNumber())
-		// logrus.Debugf("handling issue %s...", key)
 		bot.issues[key] = issue
 	}
 	return nil
@@ -518,6 +525,19 @@ func parseReference(ref string) (string, string, int, error) {
 	}
 
 	return parts[0], parts[1], id, nil
+}
+
+func dedupe(repos []*github.Repository) []*github.Repository {
+	repomap := map[string]*github.Repository{}
+	deduped := []*github.Repository{}
+	for _, repo := range repos {
+		key := repo.GetFullName()
+		if _, ok := repomap[key]; !ok {
+			repomap[key] = repo
+			deduped = append(deduped, repo)
+		}
+	}
+	return deduped
 }
 
 func in(a stringSlice, s string) bool {
