@@ -21,7 +21,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var (
+type options struct {
 	interval time.Duration
 	autofill bool
 	once     bool
@@ -36,7 +36,23 @@ var (
 	airtableTableName string
 
 	debug bool
-)
+}
+
+func (o *options) validate() error {
+	if len(o.githubToken) < 1 {
+		return errors.New("gitHub token cannot be empty")
+	}
+	if len(o.airtableAPIKey) < 1 {
+		return errors.New("airtable API Key cannot be empty")
+	}
+	if len(o.airtableBaseID) < 1 {
+		return errors.New("airtable Base ID cannot be empty")
+	}
+	if len(o.airtableTableName) < 1 {
+		return errors.New("airtable Table cannot be empty")
+	}
+	return nil
+}
 
 // stringSlice is a slice of strings
 type stringSlice []string
@@ -51,63 +67,46 @@ func (s *stringSlice) Set(value string) error {
 }
 
 func main() {
+	o := options{}
 	// Create a new cli program.
 	p := cli.NewProgram()
 	p.Name = "gitable"
 	p.Description = "Bot to automatically sync and update an airtable sheet with GitHub pull request and issue data"
-
 	// Set the GitCommit and Version.
 	p.GitCommit = version.GITCOMMIT
 	p.Version = version.VERSION
 
 	// Setup the global flags.
 	p.FlagSet = flag.NewFlagSet("global", flag.ExitOnError)
-	p.FlagSet.DurationVar(&interval, "interval", time.Minute, "update interval (ex. 5ms, 10s, 1m, 3h)")
-	p.FlagSet.BoolVar(&autofill, "autofill", false, "autofill all pull requests and issues for a user [or orgs] to a table (defaults to current user unless --orgs is set)")
-	p.FlagSet.BoolVar(&once, "once", false, "run once and exit, do not run as a daemon")
+	p.FlagSet.DurationVar(&o.interval, "interval", time.Minute, "update interval (ex. 5ms, 10s, 1m, 3h)")
+	p.FlagSet.BoolVar(&o.autofill, "autofill", false, "autofill all pull requests and issues for a user [or orgs] to a table (defaults to current user unless --orgs is set)")
+	p.FlagSet.BoolVar(&o.once, "once", false, "run once and exit, do not run as a daemon")
 
-	p.FlagSet.StringVar(&githubToken, "github-token", os.Getenv("GITHUB_TOKEN"), "GitHub API token (or env var GITHUB_TOKEN)")
-	p.FlagSet.Var(&orgs, "orgs", "organizations to include (this option only applies to --autofill)")
+	p.FlagSet.StringVar(&o.githubToken, "github-token", os.Getenv("GITHUB_TOKEN"), "GitHub API token (or env var GITHUB_TOKEN)")
+	p.FlagSet.Var(&o.orgs, "orgs", "organizations to include (this option only applies to --autofill)")
 
-	p.FlagSet.StringVar(&airtableAPIKey, "airtable-apikey", os.Getenv("AIRTABLE_APIKEY"), "Airtable API Key (or env var AIRTABLE_APIKEY)")
-	p.FlagSet.StringVar(&airtableBaseID, "airtable-baseid", os.Getenv("AIRTABLE_BASEID"), "Airtable Base ID (or env var AIRTABLE_BASEID)")
-	p.FlagSet.StringVar(&airtableTableName, "airtable-table", os.Getenv("AIRTABLE_TABLE"), "Airtable Table (or env var AIRTABLE_TABLE)")
+	p.FlagSet.StringVar(&o.airtableAPIKey, "airtable-apikey", os.Getenv("AIRTABLE_APIKEY"), "Airtable API Key (or env var AIRTABLE_APIKEY)")
+	p.FlagSet.StringVar(&o.airtableBaseID, "airtable-baseid", os.Getenv("AIRTABLE_BASEID"), "Airtable Base ID (or env var AIRTABLE_BASEID)")
+	p.FlagSet.StringVar(&o.airtableTableName, "airtable-table", os.Getenv("AIRTABLE_TABLE"), "Airtable Table (or env var AIRTABLE_TABLE)")
 
-	p.FlagSet.BoolVar(&watched, "watched", false, "include the watched repositories")
-	p.FlagSet.StringVar(&watchSince, "watch-since", "2008-01-01T00:00:00Z", "defines the starting point of the issues been watched (format: 2006-01-02T15:04:05Z). defaults to no filter")
+	p.FlagSet.BoolVar(&o.watched, "watched", false, "include the watched repositories")
+	p.FlagSet.StringVar(&o.watchSince, "watch-since", "2008-01-01T00:00:00Z", "defines the starting point of the issues been watched (format: 2006-01-02T15:04:05Z). defaults to no filter")
 
-	p.FlagSet.BoolVar(&debug, "debug", false, "enable debug logging")
-	p.FlagSet.BoolVar(&debug, "d", false, "enable debug logging")
+	p.FlagSet.BoolVar(&o.debug, "debug", false, "enable debug logging")
+	p.FlagSet.BoolVar(&o.debug, "d", false, "enable debug logging")
 
 	// Set the before function.
 	p.Before = func(ctx context.Context) error {
 		// Set the log level.
-		if debug {
+		if o.debug {
 			logrus.SetLevel(logrus.DebugLevel)
 		}
-
-		if len(githubToken) < 1 {
-			return errors.New("gitHub token cannot be empty")
-		}
-
-		if len(airtableAPIKey) < 1 {
-			return errors.New("airtable API Key cannot be empty")
-		}
-
-		if len(airtableBaseID) < 1 {
-			return errors.New("airtable Base ID cannot be empty")
-		}
-
-		if len(airtableTableName) < 1 {
-			return errors.New("airtable Table cannot be empty")
-		}
-
-		return nil
+		return o.validate()
 	}
 
 	// Set the main program action.
 	p.Action = func(ctx context.Context, args []string) error {
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(o.interval)
 
 		// On ^C, or SIGTERM handle exit.
 		c := make(chan os.Signal, 1)
@@ -126,38 +125,39 @@ func main() {
 
 		// Create the http client.
 		ts := oauth2.StaticTokenSource(
-			&oauth2.Token{AccessToken: githubToken},
+			&oauth2.Token{AccessToken: o.githubToken},
 		)
 		tc := oauth2.NewClient(ctx, ts)
 
 		// Create the github client.
 		ghClient := github.NewClient(tc)
 
+		ghUser, _, err := ghClient.Users.Get(ctx, "")
+		if err != nil {
+			logrus.Fatalf("getting current github user for token failed: %v", err)
+		}
+
 		// Create the airtable client.
-		airtableClient, err := airtable.New(airtableAPIKey, airtableBaseID)
+		airtableClient, err := airtable.New(o.airtableAPIKey, o.airtableBaseID)
 		if err != nil {
 			logrus.Fatal(err)
 		}
 
 		// Affiliation must be set before we add the user to the "orgs".
 		affiliation := "owner,collaborator"
-		if len(orgs) > 0 {
+		if len(o.orgs) > 0 {
 			affiliation += ",organization_member"
 		}
 
 		// If we didn't get any orgs explicitly passed, use the current user.
-		if len(orgs) == 0 {
-			// Get the current user for the GitHub token.
-			user, _, err := ghClient.Users.Get(ctx, "")
-			if err != nil {
-				logrus.Fatalf("getting current github user for token failed: %v", err)
-			}
-			// Add the current user to orgs.
-			orgs = append(orgs, user.GetLogin())
+		if len(o.orgs) == 0 {
+			// Add the current github user to orgs.
+			o.orgs = append(o.orgs, ghUser.GetLogin())
 		}
 
 		// Create our bot type.
 		bot := &bot{
+			ghLogin:        ghUser.GetLogin(),
 			ghClient:       ghClient,
 			airtableClient: airtableClient,
 			// Initialize our map.
@@ -165,17 +165,17 @@ func main() {
 		}
 
 		// If the user passed the once flag, just do the run once and exit.
-		if once {
-			if err := bot.run(ctx, affiliation); err != nil {
+		if o.once {
+			if err := bot.run(ctx, affiliation, o.airtableTableName, o.autofill, o.orgs, o.watched, o.watchSince); err != nil {
 				logrus.Fatal(err)
 			}
-			logrus.Infof("Updated airtable table %s for base %s", airtableTableName, airtableBaseID)
+			logrus.Infof("Updated airtable table %s for base %s", o.airtableTableName, o.airtableBaseID)
 			os.Exit(0)
 		}
 
-		logrus.Infof("Starting bot to update airtable table %s for base %s every %s", airtableTableName, airtableBaseID, interval)
+		logrus.Infof("Starting bot to update airtable table %s for base %s every %s", o.airtableTableName, o.airtableBaseID, o.interval)
 		for range ticker.C {
-			if err := bot.run(ctx, affiliation); err != nil {
+			if err := bot.run(ctx, affiliation, o.airtableTableName, o.autofill, o.orgs, o.watched, o.watchSince); err != nil {
 				logrus.Fatal(err)
 			}
 		}
@@ -187,9 +187,10 @@ func main() {
 }
 
 type bot struct {
+	ghLogin        string
+	issues         map[string]*github.Issue
 	ghClient       *github.Client
 	airtableClient *airtable.Client
-	issues         map[string]*github.Issue
 }
 
 // githubRecord holds the data for the airtable fields that define the github data.
@@ -215,13 +216,13 @@ type Fields struct {
 	Repository string
 }
 
-func (bot *bot) run(ctx context.Context, affiliation string) error {
+func (bot *bot) run(ctx context.Context, affiliation string, airtableTableName string, autofill bool, orgs stringSlice, watched bool, watchSince string) error {
 	// if we are in autofill mode, get our repositories
 	if autofill {
 		page := 1
 		perPage := 100
 		logrus.Infof("getting repositories to be autofilled for org[s]: %s...", strings.Join(orgs, ", "))
-		if err := bot.getRepositories(ctx, page, perPage, affiliation); err != nil {
+		if err := bot.getRepositories(ctx, page, perPage, affiliation, orgs); err != nil {
 			logrus.Errorf("Failed to get repos, %v\n", err)
 			return err
 		}
@@ -292,14 +293,14 @@ func (bot *bot) run(ctx context.Context, affiliation string) error {
 			}
 		}
 
-		if err := bot.applyRecordToTable(ctx, issue, record.Fields.Reference, record.ID); err != nil {
+		if err := bot.applyRecordToTable(ctx, issue, record.Fields.Reference, record.ID, airtableTableName); err != nil {
 			return err
 		}
 	}
 
 	// If we autofilled issues, loop over and create which ever ones remain.
 	for key, issue := range bot.issues {
-		if err := bot.applyRecordToTable(ctx, issue, key, ""); err != nil {
+		if err := bot.applyRecordToTable(ctx, issue, key, "", airtableTableName); err != nil {
 			logrus.Errorf("Failed to apply record to table for reference %s because %v\n", key, err)
 			continue
 		}
@@ -308,7 +309,7 @@ func (bot *bot) run(ctx context.Context, affiliation string) error {
 	return nil
 }
 
-func (bot *bot) applyRecordToTable(ctx context.Context, issue *github.Issue, key, id string) error {
+func (bot *bot) applyRecordToTable(ctx context.Context, issue *github.Issue, key, id string, airtableTableName string) error {
 	// Trim surrounding quotes from ID string.
 	id = strings.Trim(id, "\"")
 
@@ -397,7 +398,7 @@ func (bot *bot) applyRecordToTable(ctx context.Context, issue *github.Issue, key
 	return nil
 }
 
-func (bot *bot) getRepositories(ctx context.Context, page, perPage int, affiliation string) error {
+func (bot *bot) getRepositories(ctx context.Context, page, perPage int, affiliation string, orgs stringSlice) error {
 	opt := &github.RepositoryListOptions{
 		Affiliation: affiliation,
 		ListOptions: github.ListOptions{
@@ -428,7 +429,7 @@ func (bot *bot) getRepositories(ctx context.Context, page, perPage int, affiliat
 	}
 
 	page = resp.NextPage
-	return bot.getRepositories(ctx, page, perPage, affiliation)
+	return bot.getRepositories(ctx, page, perPage, affiliation, orgs)
 }
 
 func (bot *bot) getWatchedRepositories(ctx context.Context, page, perPage int, since time.Time) error {
