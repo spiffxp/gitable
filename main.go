@@ -16,7 +16,7 @@ import (
 
 	airtable "github.com/fabioberger/airtable-go"
 	"github.com/genuinetools/pkg/cli"
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v22/github"
 	"github.com/jessfraz/gitable/version"
 	"github.com/sirupsen/logrus"
 )
