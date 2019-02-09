@@ -61,14 +61,16 @@ Flags:
   --airtable-baseid  Airtable Base ID (or env var AIRTABLE_BASEID) (default: <none>)
   --airtable-table   Airtable Table (or env var AIRTABLE_TABLE) (default: <none>)
   --autofill         autofill all pull requests and issues for a user [or orgs] to a table (defaults to current user unless --orgs is set) (default: false)
+  --backfill         on the first run only, use the since date even if there is a more recent entry in airtable (default: false)
   -d, --debug        enable debug logging (default: false)
-  --github-token     GitHub API token (or env var GITHUB_TOKEN)
+  --github-token     GitHub API token (or env var GITHUB_TOKEN) (default: <none>)
   --interval         update interval (ex. 5ms, 10s, 1m, 3h) (default: 1m0s)
+  --labels           list issues with these labels only (default: [])
+  --milestone        list issues with this milestone only (ex. v1.14, '*' for all, 'none' for no milestone) (default: <none>)
   --once             run once and exit, do not run as a daemon (default: false)
   --orgs             organizations to include (this option only applies to --autofill) (default: [])
-  --watch-since      defines the starting point of the issues been watched (format: 2006-01-02T15:04:05Z). defaults to no filter (default: 2008-01-01T00:00:00Z)
+  --since            list issues since this date if there is no more recent entry in airtable (default: 2008-01-01T00:00:00Z)
   --watched          include the watched repositories (default: false)
-
 Commands:
 
   version  Show the version information.
@@ -95,8 +97,8 @@ Your airtable table must have the following fields:
 - `Updated` **(date, include time)**
 - `Created` **(date, include  time)**
 - `Completed` **(date, include time)**
-- `Project` **(link to another sheet)**
 - `Repository` **(single line text)**
+- `Milestone` **(single line text)**
 
 The only data you need to initialize **(if not running with `--autofill`)** 
 is the `Reference` which is in the format

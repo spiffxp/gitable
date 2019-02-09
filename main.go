@@ -27,17 +27,22 @@ const (
 
 type options struct {
 	interval time.Duration
-	autofill bool
 	once     bool
 
 	githubToken string
-	orgs        stringSlice
-	watched     bool
-	watchSince  string
 
 	airtableAPIKey    string
 	airtableBaseID    string
 	airtableTableName string
+
+	autofill  bool
+	orgs      stringSlice
+	watched   bool
+	since     string
+	backfill  bool
+	labels    stringSlice
+	milestone string
+	issueType string
 
 	debug bool
 }
@@ -83,18 +88,22 @@ func main() {
 	// Setup the global flags.
 	p.FlagSet = flag.NewFlagSet("global", flag.ExitOnError)
 	p.FlagSet.DurationVar(&o.interval, "interval", time.Minute, "update interval (ex. 5ms, 10s, 1m, 3h)")
-	p.FlagSet.BoolVar(&o.autofill, "autofill", false, "autofill all pull requests and issues for a user [or orgs] to a table (defaults to current user unless --orgs is set)")
 	p.FlagSet.BoolVar(&o.once, "once", false, "run once and exit, do not run as a daemon")
 
 	p.FlagSet.StringVar(&o.githubToken, "github-token", os.Getenv("GITHUB_TOKEN"), "GitHub API token (or env var GITHUB_TOKEN)")
-	p.FlagSet.Var(&o.orgs, "orgs", "organizations to include (this option only applies to --autofill)")
 
 	p.FlagSet.StringVar(&o.airtableAPIKey, "airtable-apikey", os.Getenv("AIRTABLE_APIKEY"), "Airtable API Key (or env var AIRTABLE_APIKEY)")
 	p.FlagSet.StringVar(&o.airtableBaseID, "airtable-baseid", os.Getenv("AIRTABLE_BASEID"), "Airtable Base ID (or env var AIRTABLE_BASEID)")
 	p.FlagSet.StringVar(&o.airtableTableName, "airtable-table", os.Getenv("AIRTABLE_TABLE"), "Airtable Table (or env var AIRTABLE_TABLE)")
 
+	p.FlagSet.BoolVar(&o.autofill, "autofill", false, "autofill all pull requests and issues for a user [or orgs] to a table (defaults to current user unless --orgs is set)")
+	p.FlagSet.Var(&o.orgs, "orgs", "organizations to include (this option only applies to --autofill)")
 	p.FlagSet.BoolVar(&o.watched, "watched", false, "include the watched repositories")
-	p.FlagSet.StringVar(&o.watchSince, "watch-since", "2008-01-01T00:00:00Z", "defines the starting point of the issues been watched (ex. 2006-01-02T15:04:05Z)")
+	p.FlagSet.StringVar(&o.since, "since", "2008-01-01T00:00:00Z", "list issues since this date if there is no more recent entry in airtable")
+	p.FlagSet.BoolVar(&o.backfill, "backfill", false, "on the first run only, use the since date even if there is a more recent entry in airtable")
+	p.FlagSet.Var(&o.labels, "labels", "list issues with these labels only")
+	p.FlagSet.StringVar(&o.milestone, "milestone", "", "list issues with this milestone only (ex. v1.14, '*' for all, 'none' for no milestone)")
+	p.FlagSet.StringVar(&o.issueType, "type", "any", "list issues of type 'issue', 'pr', or 'any'")
 
 	p.FlagSet.BoolVar(&o.debug, "debug", false, "enable debug logging")
 	p.FlagSet.BoolVar(&o.debug, "d", false, "enable debug logging")
@@ -164,7 +173,7 @@ func main() {
 
 		// If the user passed the once flag, just do the run once and exit.
 		if o.once {
-			if err := bot.run(ctx, o.airtableTableName, o.autofill, o.orgs, o.watched, o.watchSince); err != nil {
+			if err := bot.run(ctx, o.airtableTableName, o.autofill, o.orgs, o.watched, o.since, o.backfill, o.labels, o.milestone, o.issueType); err != nil {
 				logrus.Fatal(err)
 			}
 			logrus.Infof("Updated airtable table %s for base %s", o.airtableTableName, o.airtableBaseID)
@@ -173,7 +182,7 @@ func main() {
 
 		logrus.Infof("Starting bot to update airtable table %s for base %s every %s", o.airtableTableName, o.airtableBaseID, o.interval)
 		for range ticker.C {
-			if err := bot.run(ctx, o.airtableTableName, o.autofill, o.orgs, o.watched, o.watchSince); err != nil {
+			if err := bot.run(ctx, o.airtableTableName, o.autofill, o.orgs, o.watched, o.since, false, o.labels, o.milestone, o.issueType); err != nil {
 				logrus.Fatal(err)
 			}
 		}
@@ -210,11 +219,11 @@ type Fields struct {
 	Updated    time.Time
 	Created    time.Time
 	Completed  time.Time
-	Project    interface{}
 	Repository string
+	Milestone  string
 }
 
-func (bot *bot) run(ctx context.Context, airtableTableName string, autofill bool, orgs stringSlice, watched bool, watchSince string) error {
+func (bot *bot) run(ctx context.Context, airtableTableName string, autofill bool, orgs stringSlice, watched bool, updatedSince string, backfill bool, labels stringSlice, milestoneTitle string, issueType string) error {
 	logrus.Infof("refreshing github issues into airtable '%s'", airtableTableName)
 
 	// Get any github repos we're supposed to get
@@ -230,22 +239,23 @@ func (bot *bot) run(ctx context.Context, airtableTableName string, autofill bool
 		return fmt.Errorf("listing records for table %s failed: %v", airtableTableName, err)
 	}
 
-	// Find the most recent of watchSince and "Updated" fields in airtable
-	since, err := time.Parse("2006-01-02T15:04:05Z", watchSince)
+	// Find the most recent of updatedSince and "Updated" fields in airtable
+	since, err := time.Parse("2006-01-02T15:04:05Z", updatedSince)
 	if err != nil {
 		return err
 	}
-	for _, record := range ghRecords {
-		if record.Fields.Updated.After(since) {
-			since = record.Fields.Updated
+	if !backfill {
+		for _, record := range ghRecords {
+			if record.Fields.Updated.After(since) {
+				since = record.Fields.Updated
+			}
 		}
 	}
 
 	// Get issues for any repos we got, since the most recent date determined above
 	for _, repo := range repos {
-		if err := bot.getIssues(ctx, repo.GetOwner().GetLogin(), repo.GetName(), since); err != nil {
+		if err := bot.getIssues(ctx, repo.GetOwner().GetLogin(), repo.GetName(), since, labels, milestoneTitle, issueType); err != nil {
 			logrus.Warnf("Failed to get issues for repo %s - %v\n", repo.GetName(), err)
-			return err
 		}
 	}
 
@@ -349,6 +359,7 @@ func (bot *bot) applyRecordToTable(ctx context.Context, issue *github.Issue, key
 			Created:    issue.GetCreatedAt(),
 			Completed:  issue.GetClosedAt(),
 			Repository: repo,
+			Milestone:  issue.GetMilestone().GetTitle(),
 		},
 	}
 
@@ -365,6 +376,7 @@ func (bot *bot) applyRecordToTable(ctx context.Context, issue *github.Issue, key
 		"Created":    record.Fields.Created,
 		"Completed":  record.Fields.Completed,
 		"Repository": record.Fields.Repository,
+		"Milestone":  record.Fields.Milestone,
 	}
 
 	if id != "" {
@@ -426,22 +438,18 @@ func (bot *bot) getUserRepositories(ctx context.Context, orgs stringSlice) ([]*g
 		},
 	}
 	var allRepos []*github.Repository
-	for {
-		repos, resp, err := bot.ghClient.Repositories.List(ctx, "", opt)
-		if err != nil {
-			return nil, err
-		}
-		for _, repo := range repos {
-			if in(orgs, repo.GetOwner().GetLogin()) {
-				allRepos = append(allRepos, repo)
-			} else {
-				logrus.Debugf("ignoring repo %s because its not in %s", repo.GetFullName(), orgs)
+	for _, org := range orgs {
+		for {
+			repos, resp, err := bot.ghClient.Repositories.List(ctx, org, opt)
+			if err != nil {
+				return nil, err
 			}
+			allRepos = append(allRepos, repos...)
+			if resp.NextPage == 0 {
+				break
+			}
+			opt.Page = resp.NextPage
 		}
-		if resp.NextPage == 0 {
-			break
-		}
-		opt.Page = resp.NextPage
 	}
 	return allRepos, nil
 }
@@ -467,11 +475,21 @@ func (bot *bot) getWatchedRepositories(ctx context.Context) ([]*github.Repositor
 	return allRepos, nil
 }
 
-func (bot *bot) getIssues(ctx context.Context, owner, repo string, since time.Time) error {
-	logrus.Infof("getting github issues for repo %s/%s since %v...", owner, repo, since)
+func (bot *bot) getIssues(ctx context.Context, owner, repo string, since time.Time, labels stringSlice, milestone string, issueType string) error {
+	state := "all"
+	var err error
+	if milestone != "" && milestone != "*" && milestone != "none" {
+		milestone, err = bot.getMilestoneNumber(ctx, owner, repo, milestone)
+		if err != nil {
+			return err
+		}
+	}
+	logrus.Infof("getting github issues for repo: %s/%s since: %v state: %s labels: %v milestone: %s...", owner, repo, since, state, labels, milestone)
 	opt := &github.IssueListByRepoOptions{
-		State: "all",
-		Since: since,
+		State:     state,
+		Labels:    labels,
+		Milestone: milestone,
+		Since:     since,
 		ListOptions: github.ListOptions{
 			Page:    1,
 			PerPage: githubPageSize,
@@ -483,7 +501,15 @@ func (bot *bot) getIssues(ctx context.Context, owner, repo string, since time.Ti
 		if err != nil {
 			return err
 		}
-		allIssues = append(allIssues, issues...)
+		if issueType == "any" {
+			allIssues = append(allIssues, issues...)
+		} else {
+			for _, issue := range issues {
+				if (issueType == "pr" && issue.IsPullRequest()) || (issueType == "issue" && !issue.IsPullRequest()) {
+					allIssues = append(allIssues, issue)
+				}
+			}
+		}
 		if resp.NextPage == 0 {
 			break
 		}
@@ -492,9 +518,25 @@ func (bot *bot) getIssues(ctx context.Context, owner, repo string, since time.Ti
 
 	for _, issue := range allIssues {
 		key := createReference(owner, repo, issue.GetNumber())
+		logrus.Debugf("Adding issue %s to issues", key)
 		bot.issues[key] = issue
 	}
 	return nil
+}
+
+func (bot *bot) getMilestoneNumber(ctx context.Context, owner, repo, milestone string) (string, error) {
+	logrus.Debugf("finding milestone number for milestone: %s in %s/%s", milestone, owner, repo)
+	opt := &github.MilestoneListOptions{}
+	milestones, _, err := bot.ghClient.Issues.ListMilestones(ctx, owner, repo, opt)
+	if err != nil {
+		return "", err
+	}
+	for _, m := range milestones {
+		if m.GetTitle() == milestone {
+			return strconv.Itoa(m.GetNumber()), nil
+		}
+	}
+	return "", fmt.Errorf("milestone '%s' not found for %s/%s", milestone, owner, repo)
 }
 
 // convert ("org", "repo", 123) into "org/repo#123"
