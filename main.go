@@ -21,6 +21,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+const (
+	githubPageSize = 100
+)
+
 type options struct {
 	interval time.Duration
 	autofill bool
@@ -219,10 +223,7 @@ type Fields struct {
 func (bot *bot) run(ctx context.Context, affiliation string, airtableTableName string, autofill bool, orgs stringSlice, watched bool, watchSince string) error {
 	// if we are in autofill mode, get our repositories
 	if autofill {
-		page := 1
-		perPage := 100
-		logrus.Infof("getting repositories to be autofilled for org[s]: %s...", strings.Join(orgs, ", "))
-		if err := bot.getRepositories(ctx, page, perPage, affiliation, orgs); err != nil {
+		if err := bot.getRepositories(ctx, affiliation, orgs); err != nil {
 			logrus.Errorf("Failed to get repos, %v\n", err)
 			return err
 		}
@@ -246,11 +247,8 @@ func (bot *bot) run(ctx context.Context, affiliation string, airtableTableName s
 
 	// if we are in watching mode, get your watched repositories
 	if watched {
-		page := 1
-		perPage := 100
-		logrus.Info("getting repositories watched...")
-
-		if err := bot.getWatchedRepositories(ctx, page, perPage, since); err != nil {
+		if err := bot.getWatchedRepositories(ctx, since); err != nil {
+			logrus.Errorf("Failed to get watched repos, %v\n", err)
 			return err
 		}
 	}
@@ -398,100 +396,106 @@ func (bot *bot) applyRecordToTable(ctx context.Context, issue *github.Issue, key
 	return nil
 }
 
-func (bot *bot) getRepositories(ctx context.Context, page, perPage int, affiliation string, orgs stringSlice) error {
+func (bot *bot) getRepositories(ctx context.Context, affiliation string, orgs stringSlice) error {
+	logrus.Infof("getting repositories for org[s]: %s...", strings.Join(orgs, ", "))
 	opt := &github.RepositoryListOptions{
 		Affiliation: affiliation,
 		ListOptions: github.ListOptions{
-			Page:    page,
-			PerPage: perPage,
+			Page:    1,
+			PerPage: githubPageSize,
 		},
 	}
-	repos, resp, err := bot.ghClient.Repositories.List(ctx, "", opt)
-	if err != nil {
-		return err
+	var allRepos []*github.Repository
+	for {
+		repos, resp, err := bot.ghClient.Repositories.List(ctx, "", opt)
+		if err != nil {
+			return err
+		}
+		allRepos = append(allRepos, repos...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
 	}
 
-	for _, repo := range repos {
-		// logrus.Debugf("checking if %s is in (%s)", repo.GetOwner().GetLogin(), strings.Join(orgs, " | "))
+	for _, repo := range allRepos {
+		logrus.Debugf("checking if %s is in (%s)", repo.GetOwner().GetLogin(), strings.Join(orgs, " | "))
 		if in(orgs, repo.GetOwner().GetLogin()) {
 			logrus.Debugf("getting issues for repo %s...", repo.GetFullName())
-			ipage := 0
-			if err := bot.getIssues(ctx, ipage, perPage, repo.GetOwner().GetLogin(), repo.GetName(), repo.UpdatedAt.Time); err != nil {
+			if err := bot.getIssues(ctx, repo.GetOwner().GetLogin(), repo.GetName(), repo.UpdatedAt.Time); err != nil {
 				logrus.Debugf("Failed to get issues for repo %s - %v\n", repo.GetName(), err)
 				return err
 			}
 		}
 	}
 
-	// Return early if we are on the last page.
-	if page == resp.LastPage || resp.NextPage == 0 {
-		return nil
-	}
-
-	page = resp.NextPage
-	return bot.getRepositories(ctx, page, perPage, affiliation, orgs)
+	return nil
 }
 
-func (bot *bot) getWatchedRepositories(ctx context.Context, page, perPage int, since time.Time) error {
+func (bot *bot) getWatchedRepositories(ctx context.Context, since time.Time) error {
+	logrus.Infof("getting repositories watched by %s...", bot.ghLogin)
 	opt := &github.ListOptions{
-		Page:    page,
-		PerPage: perPage,
+		Page:    1,
+		PerPage: githubPageSize,
+	}
+	var allRepos []*github.Repository
+	for {
+		repos, resp, err := bot.ghClient.Activity.ListWatched(ctx, "", opt)
+		if err != nil {
+			return err
+		}
+		allRepos = append(allRepos, repos...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
 	}
 
-	repos, resp, err := bot.ghClient.Activity.ListWatched(ctx, "", opt)
-	if err != nil {
-		return err
-	}
-
-	for _, repo := range repos {
-		// logrus.Debugf("checking if %s is in (%s)", repo.GetOwner().GetLogin(), strings.Join(orgs, " | "))
-		// logrus.Debugf("getting issues for repo %s...", repo.GetFullName())
-		ipage := 0
-		if err := bot.getIssues(ctx, ipage, perPage, repo.GetOwner().GetLogin(), repo.GetName(), since); err != nil {
+	for _, repo := range allRepos {
+		logrus.Infof("getting issues for repo %s...", repo.GetFullName())
+		if err := bot.getIssues(ctx, repo.GetOwner().GetLogin(), repo.GetName(), since); err != nil {
 			return err
 		}
 	}
-
-	// Return early if we are on the last page.
-	if page == resp.LastPage || resp.NextPage == 0 {
-		return nil
-	}
-
-	page = resp.NextPage
-	return bot.getWatchedRepositories(ctx, page, perPage, since)
+	return nil
 }
 
-func (bot *bot) getIssues(ctx context.Context, page, perPage int, owner, repo string, since time.Time) error {
+func (bot *bot) getIssues(ctx context.Context, owner, repo string, since time.Time) error {
 	opt := &github.IssueListByRepoOptions{
 		State: "all",
 		Since: since,
 		ListOptions: github.ListOptions{
-			Page:    page,
-			PerPage: perPage,
+			Page:    1,
+			PerPage: githubPageSize,
 		},
 	}
-
-	issues, resp, err := bot.ghClient.Issues.ListByRepo(ctx, owner, repo, opt)
-	if err != nil {
-		return err
+	var allIssues []*github.Issue
+	for {
+		issues, resp, err := bot.ghClient.Issues.ListByRepo(ctx, owner, repo, opt)
+		if err != nil {
+			return err
+		}
+		allIssues = append(allIssues, issues...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
 	}
 
-	for _, issue := range issues {
-		key := fmt.Sprintf("%s/%s#%d", owner, repo, issue.GetNumber())
-
+	for _, issue := range allIssues {
+		key := createReference(owner, repo, issue.GetNumber())
 		// logrus.Debugf("handling issue %s...", key)
 		bot.issues[key] = issue
 	}
-
-	// Return early if we are on the last page.
-	if page == resp.LastPage || resp.NextPage == 0 {
-		return nil
-	}
-
-	page = resp.NextPage
-	return bot.getIssues(ctx, page, perPage, owner, repo, since)
+	return nil
 }
 
+// convert ("org", "repo", 123) into "org/repo#123"
+func createReference(owner string, repo string, number int) string {
+	return fmt.Sprintf("%s/%s#%d", owner, repo, number)
+}
+
+// split "org/repo#123" into ("org", "repo", 123)
 func parseReference(ref string) (string, string, int, error) {
 	// Split the reference into repository and issue number.
 	parts := strings.SplitN(ref, "#", 2)
